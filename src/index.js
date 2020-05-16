@@ -44,6 +44,7 @@ const HAS_PAINT = /(paint\(|-moz-element\(#paint-|-webkit-canvas\(paint-|[('"]bl
 const USE_CSS_CANVAS_CONTEXT = 'getCSSCanvasContext' in document;
 const USE_CSS_ELEMENT = (testStyles.backgroundImage = `-moz-element(#${GLOBAL_ID})`) === testStyles.backgroundImage;
 const HAS_PROMISE = (typeof Promise === 'function');
+const ORIGINAL_ATTACH_SHADOW = Element.prototype.attachShadow;
 testStyles.cssText = '';
 
 let supportsStyleMutations = true;
@@ -126,8 +127,16 @@ function walk(node, iterator) {
 	}
 }
 
+// Find styleSheets inside shadowDOM as well as in the document.
+function findStyleSheets() {
+	return [
+		...[].slice.call(document.styleSheets),
+		...[].slice.call(document.querySelectorAll('* *')).filter(el => el.shadowRoot).flatMap(el => [].slice.call(el.shadowRoot.styleSheets))
+	];
+}
+
 function update() {
-	let sheets = [].slice.call(document.styleSheets),
+	let sheets = findStyleSheets(),
 		context = {
 			toProcess: [],
 			toRemove: [],
@@ -227,7 +236,7 @@ function processNewSheet(node) {
 	if (node.$$isPaint) return;
 
 	if (node.href) {
-		fetchText(node.href, processRemoteSheet);
+		fetchText(node.href, processRemoteSheet(node));
 		return false;
 	}
 
@@ -240,19 +249,34 @@ function processNewSheet(node) {
 	}
 }
 
-function processRemoteSheet(css) {
-	let style = document.createElement('style');
-	style.disabled = true;
-	style.$$paintid = ++styleSheetCounter;
-	style.appendChild(document.createTextNode(escapePaintRules(css)));
-	(document.head || document.createElement('head')).appendChild(style);
-	let sheet = style.sheet,
-		toDelete = [],
-		rule;
-	walkStyles(sheet, accumulateNonPaintRules, toDelete);
-	while ( (rule = toDelete.pop()) ) replaceRule(rule, null);
-	update();
-	style.disabled = false;
+function processRemoteSheet(node) {
+	return css => {
+		let style = document.createElement('style');
+		style.disabled = true;
+		style.$$paintid = ++styleSheetCounter;
+		style.appendChild(document.createTextNode(escapePaintRules(css)));
+		// Hotfix for shadowDOM problem.
+		if(document.contains(node)) {
+			(document.head || document.createElement('head')).appendChild(style);
+		} else {
+			let currentNode = node;
+			while(currentNode) {
+				if(!currentNode.parentNode) {
+					currentNode.appendChild(style);
+					break;
+				}
+				currentNode = currentNode.parentNode;
+			}
+		}
+
+		let sheet = style.sheet,
+			toDelete = [],
+			rule;
+		walkStyles(sheet, accumulateNonPaintRules, toDelete);
+		while ( (rule = toDelete.pop()) ) replaceRule(rule, null);
+		update();
+		style.disabled = false;
+	}
 }
 
 function accumulateNonPaintRules(rule, nonPaintRules) {
@@ -318,8 +342,28 @@ function getPaintRuleForElement(element) {
 		if (!element.hasAttribute('data-css-paint')) {
 			element.setAttribute('data-css-paint', paintId);
 		}
-		let index = overrideStyles.insertRule(`[data-css-paint="${idCounter}"] {}`, overrideStyles.cssRules.length);
-		paintRule = element.$$paintRule = overrideStyles.cssRules[index];
+
+		// Hotfix for shadowDOM problem.
+		if(document.contains(element)) {
+			let index = overrideStyles.insertRule(`[data-css-paint="${idCounter}"] {}`, overrideStyles.cssRules.length);
+			paintRule = element.$$paintRule = overrideStyles.cssRules[index];
+		} else {
+			let currentNode = element;
+			while(currentNode) {
+				if(!currentNode.parentNode) {
+					let overrides = currentNode.querySelector(`#${GLOBAL_ID}`);
+					if(!overrides) {
+						overrides = currentNode.appendChild(overridesStylesheet);
+					}
+
+					let index = overrides.sheet.insertRule(`[data-css-paint="${idCounter}"] {}`, overrides.sheet.cssRules.length);
+					paintRule = element.$$paintRule = overrides.sheet.cssRules[index];
+
+					break;
+				}
+				currentNode = currentNode.parentNode;
+			}
+		}
 	}
 	return paintRule;
 }
@@ -368,6 +412,21 @@ const propertiesContainer = {
 
 let idCounter = 0;
 function updateElement(element, computedStyle) {
+
+	// Hotfix for shadowmDOM problem.
+	let elRoot = root;
+	let inShadow = !document.contains(element);
+	if(inShadow) {
+		let currentNode = element;
+		while(currentNode) {
+			if(!currentNode.parentNode) {
+				elRoot = currentNode;
+				break;
+			}
+			currentNode = currentNode.parentNode;
+		}
+	}
+
 	overridesStylesheet.disabled = true;
 	let style = currentProperties = computedStyle==null ? getComputedStyle(element) : computedStyle;
 	// element.$$paintGeom = style;
@@ -461,7 +520,7 @@ function updateElement(element, computedStyle) {
 				cssContextId = `paint-${paintId}-${painterName}`;
 			if (!ctx || !ctx.canvas || ctx.canvas.width!=actualWidth || ctx.canvas.height!=actualHeight) {
 				if (USE_CSS_CANVAS_CONTEXT===true) {
-					ctx = document.getCSSCanvasContext('2d', cssContextId, actualWidth, actualHeight);
+					ctx = (inShadow ? elRoot : document).getCSSCanvasContext('2d', cssContextId, actualWidth, actualHeight);
 				}
 				else {
 					let canvas = document.createElement('canvas');
@@ -470,7 +529,7 @@ function updateElement(element, computedStyle) {
 					canvas.height = actualHeight;
 					if (USE_CSS_ELEMENT===true) {
 						canvas.style.display = 'none';
-						root.appendChild(canvas);
+						elRoot.appendChild(canvas);
 					}
 					ctx = canvas.getContext('2d');
 				}
@@ -607,6 +666,14 @@ function parseCssDimensions(arr) {
 }
 
 class PaintWorklet {
+
+	mutLock = false;
+	mut;
+
+	_observerShadow(shadowRoot) {
+		this.mut.observe(shadowRoot, { childList: true, attributes: true, subtree: true});
+	}
+
 	constructor() {
 		raf(update);
 
@@ -615,10 +682,9 @@ class PaintWorklet {
 
 		let supportsStyleMutations = false;
 
-		let lock = false;
-		new MutationObserver(records => {
-			if (lock===true) return;
-			lock = true;
+		this.mut = new MutationObserver(records => {
+			if (this.mutLock===true) return;
+			this.mutLock = true;
 			for (let i = 0; i < records.length; i++) {
 				let record = records[i], added;
 				if (record.type === 'childList' && (added = record.addedNodes)) {
@@ -637,8 +703,21 @@ class PaintWorklet {
 					}
 				}
 			}
-			lock = false;
-		}).observe(document.body, {
+			this.mutLock = false;
+		});
+
+		// There is no event fired for attachShadow. MutationObserver also does not trigger on shadowDOM unless you observe the shadowRoot.
+		// Overrides the attachShadow func so we can observe insite shadowDOM.
+		Object.defineProperty(Element.prototype, 'attachShadow', {
+			value: function(args) {
+				let shadowRoot = ORIGINAL_ATTACH_SHADOW.call(this, args);
+				paintWorklet._observerShadow(shadowRoot);
+
+				return shadowRoot;
+			}
+		})
+
+		this.mut.observe(document.body, {
 			childList: true,
 			attributes: true,
 			subtree: true

@@ -34,6 +34,27 @@ if (!window.performance) window.performance = { now: Date.now.bind(Date) };
 if (!window.requestAnimationFrame) window.requestAnimationFrame = function(cb) { return setTimeout(doAnim, cb); };
 function doAnim(cb) { cb(performance.now()); }
 
+let root = document.querySelector('#shadow').attachShadow({mode: 'open'});
+console.log('root!', root);
+let otherObs = new MutationObserver(muts => {
+	console.log('otherObs!', muts);
+});
+console.log(root);
+// otherObs.observe(root, {childList: true, attributes: true, subtree: true});
+
+let shadowLink = document.createElement('link');
+shadowLink.setAttribute('rel', 'stylesheet');
+shadowLink.setAttribute('href', 'style.css');
+root.appendChild(shadowLink);
+
+let shadowBtn = document.createElement('button');
+shadowBtn.innerHTML = 'Shadow DOM!';
+shadowBtn.classList.add('ripple');
+root.appendChild(shadowBtn);
+
+let shadowBr = document.createElement('br');
+root.appendChild(shadowBr);
+
 function ripple(evt) {
 	var button = this,
 		rect = button.getBoundingClientRect(),
@@ -52,6 +73,8 @@ function ripple(evt) {
 		requestAnimationFrame(raf);
 	})
 }
-[].forEach.call(document.querySelectorAll('.ripple'), function (el) {
-	el.addEventListener('click', ripple);
-});
+
+[
+	...document.querySelectorAll('.ripple'),
+	...root.querySelectorAll('.ripple'),
+].forEach(el => el.addEventListener('click', ripple));
